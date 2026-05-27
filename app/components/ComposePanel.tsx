@@ -27,6 +27,7 @@ export default function ComposePanel() {
 		setSubject,
 		body,
 		setBody,
+		fromAddress,
 		error,
 		isSavingDraft,
 		isSending,
@@ -64,6 +65,20 @@ export default function ComposePanel() {
 					{error && <Banner variant="error" text={error} />}
 
 					<div className="space-y-3">
+						<div className="flex items-center gap-2">
+							<label className="text-sm font-medium text-kumo-subtle w-14 shrink-0">
+								From
+							</label>
+							<div className="flex-1">
+								<Input
+									type="email"
+									size="sm"
+									value={fromAddress || ""}
+									disabled
+								/>
+							</div>
+						</div>
+
 						<div className="flex items-center gap-2">
 							<label className="text-sm font-medium text-kumo-subtle w-14 shrink-0">
 								To

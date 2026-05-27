@@ -17,18 +17,24 @@ import {
 import { useDeleteEmail, useForwardEmail, useReplyToEmail, useSaveDraft, useSendEmail } from "~/queries/emails";
 import { useMailbox } from "~/queries/mailboxes";
 import { useUIStore } from "~/hooks/useUIStore";
+import {
+	isAliasRoutingEnabled,
+	matchesAliasRoute,
+	normalizeEmailAddress,
+	type MailboxAliasSettings,
+} from "../../shared/alias-routing";
 
 function appendUniqueAddress(
 	addresses: string[],
 	seen: Set<string>,
 	address: string,
-	exclude?: string,
+	exclude?: Set<string>,
 ) {
 	const trimmed = address.trim();
 	if (!trimmed) return;
 
 	const normalized = trimmed.toLowerCase();
-	if (normalized === exclude || seen.has(normalized)) return;
+	if (exclude?.has(normalized) || seen.has(normalized)) return;
 
 	seen.add(normalized);
 	addresses.push(trimmed);
@@ -72,14 +78,14 @@ function buildForwardBody(
 
 function buildReplyAllFields(
 	original: NonNullable<ReturnType<typeof useUIStore.getState>["composeOptions"]["originalEmail"]>,
-	selfAddress?: string,
+	selfAddresses: Set<string>,
 ) {
 	const toRecipients: string[] = [];
 	const toSeen = new Set<string>();
-	appendUniqueAddress(toRecipients, toSeen, original.sender, selfAddress);
+	appendUniqueAddress(toRecipients, toSeen, original.sender, selfAddresses);
 
 	for (const recipient of splitEmailList(original.recipient)) {
-		appendUniqueAddress(toRecipients, toSeen, recipient, selfAddress);
+		appendUniqueAddress(toRecipients, toSeen, recipient, selfAddresses);
 	}
 
 	const ccRecipients: string[] = [];
@@ -87,7 +93,7 @@ function buildReplyAllFields(
 	for (const recipient of splitEmailList(original.cc)) {
 		const normalized = recipient.toLowerCase();
 		if (
-			normalized === selfAddress ||
+			selfAddresses.has(normalized) ||
 			toSeen.has(normalized) ||
 			ccSeen.has(normalized)
 		) {
@@ -104,9 +110,25 @@ function buildReplyAllFields(
 	};
 }
 
+function getReplyFromAddress(
+	original: NonNullable<ReturnType<typeof useUIStore.getState>["composeOptions"]["originalEmail"]> | null | undefined,
+	mailboxEmail: string | undefined,
+	settings: unknown,
+): string | undefined {
+	if (!original || !mailboxEmail || !isAliasRoutingEnabled(settings as MailboxAliasSettings)) {
+		return mailboxEmail;
+	}
+
+	const alias = splitEmailList(original.recipient).find((recipient) =>
+		matchesAliasRoute(mailboxEmail, recipient),
+	);
+	return alias ? normalizeEmailAddress(alias) : mailboxEmail;
+}
+
 function buildInitialComposeFields(
 	composeOptions: ReturnType<typeof useUIStore.getState>["composeOptions"],
 	mailboxEmail: string | undefined,
+	fromAddress: string | undefined,
 	sigBlock: string,
 ): ComposeFormFields {
 	const { draftEmail: draft, originalEmail: original, mode } = composeOptions;
@@ -139,7 +161,12 @@ function buildInitialComposeFields(
 	}
 
 	if (mode === "reply-all") {
-		const recipients = buildReplyAllFields(original, mailboxEmail?.toLowerCase());
+		const selfAddresses = new Set(
+			[mailboxEmail, fromAddress]
+				.filter(Boolean)
+				.map((address) => normalizeEmailAddress(address!)),
+		);
+		const recipients = buildReplyAllFields(original, selfAddresses);
 		return {
 			...EMPTY_FIELDS,
 			...recipients,
@@ -181,7 +208,7 @@ export function useComposeForm(mailboxId?: string, _folder?: string) {
 	const [error, setError] = useState<string | null>(null);
 	const [isSavingDraft, setIsSavingDraft] = useState(false);
 	const [isSending, setIsSending] = useState(false);
-	const lastInitializedOptionsRef = useRef<typeof composeOptions | null>(null);
+	const lastInitializedKeyRef = useRef<string | null>(null);
 	const isDraftEdit = !!composeOptions.draftEmail;
 
 	const formTitle = useMemo(() => {
@@ -190,14 +217,41 @@ export function useComposeForm(mailboxId?: string, _folder?: string) {
 	}, [composeOptions.mode, isDraftEdit]);
 
 	const sigBlock = useMemo(() => getSignatureBlock(currentMailbox?.settings), [currentMailbox]);
+	const fromAddress = useMemo(() => {
+		if (composeOptions.draftEmail?.sender) {
+			return composeOptions.draftEmail.sender;
+		}
+		if (composeOptions.mode === "reply" || composeOptions.mode === "reply-all") {
+			return getReplyFromAddress(
+				composeOptions.originalEmail,
+				currentMailbox?.email,
+				currentMailbox?.settings,
+			);
+		}
+		return currentMailbox?.email;
+	}, [
+		composeOptions.draftEmail?.sender,
+		composeOptions.mode,
+		composeOptions.originalEmail,
+		currentMailbox?.email,
+		currentMailbox?.settings,
+	]);
 
 	useEffect(() => {
-		if (lastInitializedOptionsRef.current === composeOptions) return;
-		lastInitializedOptionsRef.current = composeOptions;
+		const initializeKey = [
+			composeOptions.mode,
+			composeOptions.originalEmail?.id || "",
+			composeOptions.draftEmail?.id || "",
+			fromAddress || "",
+			sigBlock,
+		].join("::");
+		if (lastInitializedKeyRef.current === initializeKey) return;
+		lastInitializedKeyRef.current = initializeKey;
 
 		const initialFields = buildInitialComposeFields(
 			composeOptions,
 			currentMailbox?.email,
+			fromAddress,
 			sigBlock,
 		);
 		setError(null);
@@ -207,7 +261,7 @@ export function useComposeForm(mailboxId?: string, _folder?: string) {
 		setShowCcBcc(initialFields.showCcBcc);
 		setSubject(initialFields.subject);
 		setBody(initialFields.body);
-	}, [composeOptions, currentMailbox?.email, sigBlock]);
+	}, [composeOptions, currentMailbox?.email, fromAddress, sigBlock]);
 
 	const handleSaveDraft = async () => {
 		if (!mailboxId || isSending) return; setIsSavingDraft(true); setError(null);
@@ -218,6 +272,7 @@ export function useComposeForm(mailboxId?: string, _folder?: string) {
 				bcc: bcc || undefined,
 				subject,
 				body,
+				from: fromAddress,
 				in_reply_to: composeOptions.originalEmail?.id || composeOptions.draftEmail?.in_reply_to || undefined,
 				thread_id: composeOptions.originalEmail?.thread_id || composeOptions.draftEmail?.thread_id || undefined,
 				draft_id: composeOptions.draftEmail?.id || undefined,
@@ -239,7 +294,8 @@ export function useComposeForm(mailboxId?: string, _folder?: string) {
 		if (toRecipients.length === 0) { setError("Add at least one recipient."); return; }
 		const ccRecipients = splitEmailList(cc); const bccRecipients = splitEmailList(bcc);
 		const fromName = currentMailbox.settings?.fromName || currentMailbox.name;
-		const from = fromName && fromName !== currentMailbox.email ? { email: currentMailbox.email, name: fromName } : currentMailbox.email;
+		const senderEmail = fromAddress || currentMailbox.email;
+		const from = fromName && fromName !== senderEmail ? { email: senderEmail, name: fromName } : senderEmail;
 		const emailData = {
 			to: toEmailListValue(toRecipients),
 			cc: toEmailListValue(ccRecipients),
@@ -262,5 +318,5 @@ export function useComposeForm(mailboxId?: string, _folder?: string) {
 		finally { setIsSending(false); }
 	};
 
-	return { to, setTo, cc, setCc, bcc, setBcc, showCcBcc, setShowCcBcc, subject, setSubject, body, setBody, error, setError, isSavingDraft, isSending, formTitle, handleSaveDraft, handleSend, closeCompose, closePanel };
+	return { to, setTo, cc, setCc, bcc, setBcc, showCcBcc, setShowCcBcc, subject, setSubject, body, setBody, fromAddress, error, setError, isSavingDraft, isSending, formTitle, handleSaveDraft, handleSend, closeCompose, closePanel };
 }

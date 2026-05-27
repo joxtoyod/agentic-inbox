@@ -30,6 +30,7 @@ export default function ComposeEmail() {
 		setSubject,
 		body,
 		setBody,
+		fromAddress,
 		error,
 		isSavingDraft,
 		isSending,
@@ -49,6 +50,13 @@ export default function ComposeEmail() {
 				</Dialog.Title>
 				<form onSubmit={(e) => handleSend(e, closeComposeModal)} className="space-y-4">
 					{error && <Banner variant="error" text={error} />}
+					<Input
+						label="From"
+						type="email"
+						size="sm"
+						value={fromAddress || ""}
+						disabled
+					/>
 					<div className="flex items-center gap-2">
 						<div className="flex-1">
 							<Input

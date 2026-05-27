@@ -14,12 +14,19 @@ import {
 	generateMessageId,
 	buildThreadingHeaders,
 	listMailboxes,
+	listMailboxesWithSettings,
 } from "./lib/email-helpers";
 import { SendEmailRequestSchema } from "./lib/schemas";
 import { handleReplyEmail, handleForwardEmail } from "./routes/reply-forward";
 import { Folders } from "../shared/folders";
 import type { Env } from "./types";
 import { requireMailbox, type MailboxContext } from "./lib/mailbox";
+import {
+	aliasRoutesOverlap,
+	isAliasRoutingEnabled,
+	matchesAliasRoute,
+	normalizeEmailAddress,
+} from "../shared/alias-routing";
 
 type AppContext = Context<MailboxContext>;
 
@@ -37,6 +44,7 @@ const DraftBody = z.object({
 	bcc: z.string().optional(),
 	subject: z.string().optional(),
 	body: z.string(),
+	from: z.string().email().optional(),
 	in_reply_to: z.string().optional(),
 	thread_id: z.string().optional(),
 	draft_id: z.string().optional(),
@@ -61,6 +69,31 @@ function boolQuery(c: AppContext, key: string): boolean | undefined {
 	const v = c.req.query(key);
 	if (v === undefined || v === "") return undefined;
 	return v === "true" || v === "1";
+}
+
+async function validateAliasRouting(
+	bucket: R2Bucket,
+	mailboxEmail: string,
+	settings: Record<string, unknown> | undefined,
+): Promise<string | null> {
+	if (!isAliasRoutingEnabled(settings)) return null;
+	const mailboxes = await listMailboxesWithSettings(bucket);
+	const overlapping = mailboxes.find(
+		(mailbox) =>
+			mailbox.email !== mailboxEmail &&
+			isAliasRoutingEnabled(mailbox.settings) &&
+			aliasRoutesOverlap(mailbox.email, mailboxEmail),
+	);
+	if (!overlapping) return null;
+	return `Alias routing overlaps with ${overlapping.email}`;
+}
+
+async function getMailboxSettings(
+	bucket: R2Bucket,
+	mailboxId: string,
+): Promise<Record<string, unknown>> {
+	const obj = await bucket.get(`mailboxes/${mailboxId}.json`);
+	return obj ? ((await obj.json().catch(() => ({}))) as Record<string, unknown>) : {};
 }
 
 // -- App & middleware -----------------------------------------------
@@ -108,8 +141,10 @@ app.post("/api/v1/mailboxes", async (c) => {
 	}
 	const key = `mailboxes/${email}.json`;
 	if (await c.env.BUCKET.head(key)) return c.json({ error: "Mailbox already exists" }, 409);
-	const defaultSettings = { fromName: name, forwarding: { enabled: false, email: "" }, signature: { enabled: false, text: "" }, autoReply: { enabled: false, subject: "", message: "" } };
+	const defaultSettings = { fromName: name, forwarding: { enabled: false, email: "" }, signature: { enabled: false, text: "" }, autoReply: { enabled: false, subject: "", message: "" }, aliasRouting: { enabled: false } };
 	const finalSettings = { ...defaultSettings, ...settings };
+	const aliasError = await validateAliasRouting(c.env.BUCKET, email, finalSettings);
+	if (aliasError) return c.json({ error: aliasError }, 409);
 	await c.env.BUCKET.put(key, JSON.stringify(finalSettings));
 	const stub = c.env.MAILBOX.get(c.env.MAILBOX.idFromName(email));
 	await stub.getFolders();
@@ -128,6 +163,8 @@ app.put("/api/v1/mailboxes/:mailboxId", async (c) => {
 	const { settings } = (await c.req.json()) as { settings: Record<string, unknown> };
 	const key = `mailboxes/${mailboxId}.json`;
 	if (!(await c.env.BUCKET.head(key))) return c.json({ error: "Not found" }, 404);
+	const aliasError = await validateAliasRouting(c.env.BUCKET, mailboxId, settings);
+	if (aliasError) return c.json({ error: aliasError }, 409);
 	await c.env.BUCKET.put(key, JSON.stringify(settings));
 	return c.json({ id: mailboxId, name: mailboxId, email: mailboxId, settings });
 });
@@ -172,7 +209,8 @@ app.post("/api/v1/mailboxes/:mailboxId/emails", async (c: AppContext) => {
 
 	let toStr: string, fromEmail: string, fromDomain: string;
 	try {
-		({ toStr, fromEmail, fromDomain } = validateSender(to, from, mailboxId));
+		const settings = await getMailboxSettings(c.env.BUCKET, mailboxId);
+		({ toStr, fromEmail, fromDomain } = validateSender(to, from, mailboxId, settings));
 	} catch (e) {
 		if (e instanceof SenderValidationError) return c.json({ error: e.message }, 400);
 		throw e;
@@ -213,13 +251,13 @@ app.post("/api/v1/mailboxes/:mailboxId/emails", async (c: AppContext) => {
 
 app.post("/api/v1/mailboxes/:mailboxId/drafts", async (c: AppContext) => {
 	const mailboxId = c.req.param("mailboxId")!;
-	const { to, cc, bcc, subject, body, in_reply_to, thread_id, draft_id } = DraftBody.parse(await c.req.json());
+	const { to, cc, bcc, subject, body, from, in_reply_to, thread_id, draft_id } = DraftBody.parse(await c.req.json());
 	const stub = c.var.mailboxStub;
 	if (draft_id) await stub.deleteEmail(draft_id); // not atomic — create-then-delete would be safer
 	const messageId = crypto.randomUUID();
 	const now = new Date().toISOString();
 	await stub.createEmail(Folders.DRAFT, {
-		id: messageId, subject: subject || "", sender: mailboxId.toLowerCase(),
+		id: messageId, subject: subject || "", sender: (from || mailboxId).toLowerCase(),
 		recipient: (to || "").toLowerCase(), cc: cc?.toLowerCase() || null, bcc: bcc?.toLowerCase() || null,
 		date: now, body, in_reply_to: in_reply_to || null, email_references: null,
 		thread_id: thread_id || in_reply_to || messageId,
@@ -329,6 +367,11 @@ app.get("/api/v1/mailboxes/:mailboxId/emails/:emailId/attachments/:attachmentId"
 
 const MAX_EMAIL_SIZE = 25 * 1024 * 1024;
 
+type InboundDeliveryTarget = {
+	mailboxId: string;
+	recipients: Set<string>;
+};
+
 async function streamToArrayBuffer(stream: ReadableStream, streamSize: number) {
 	if (streamSize > MAX_EMAIL_SIZE) throw new Error(`Email too large: ${streamSize} bytes exceeds ${MAX_EMAIL_SIZE} byte limit`);
 	if (streamSize <= 0) throw new Error(`Invalid stream size: ${streamSize}`);
@@ -345,62 +388,161 @@ async function streamToArrayBuffer(stream: ReadableStream, streamSize: number) {
 	return result;
 }
 
+function getConfiguredDomains(env: Env): Set<string> {
+	return new Set(
+		(env.DOMAINS || "")
+			.split(",")
+			.map((d) => d.trim().toLowerCase())
+			.filter(Boolean),
+	);
+}
+
+async function resolveInboundDeliveryTargets(
+	env: Env,
+	recipients: string[],
+): Promise<InboundDeliveryTarget[]> {
+	const allowedAddresses = new Set(
+		((env.EMAIL_ADDRESSES ?? []) as string[]).map(normalizeEmailAddress),
+	);
+	const configuredDomains = getConfiguredDomains(env);
+	const mailboxes = await listMailboxesWithSettings(env.BUCKET);
+	const mailboxByEmail = new Map(
+		mailboxes.map((mailbox) => [normalizeEmailAddress(mailbox.email), mailbox]),
+	);
+	const targets = new Map<string, InboundDeliveryTarget>();
+
+	const addTarget = (mailboxId: string, recipient: string) => {
+		const normalizedMailboxId = normalizeEmailAddress(mailboxId);
+		const existing = targets.get(normalizedMailboxId);
+		if (existing) {
+			existing.recipients.add(recipient);
+			return;
+		}
+		targets.set(normalizedMailboxId, {
+			mailboxId: normalizedMailboxId,
+			recipients: new Set([recipient]),
+		});
+	};
+
+	for (const rawRecipient of recipients) {
+		const recipient = normalizeEmailAddress(rawRecipient);
+		if (!recipient) continue;
+
+		const exactMailbox = mailboxByEmail.get(recipient);
+		if (
+			exactMailbox &&
+			(allowedAddresses.size === 0 || allowedAddresses.has(recipient))
+		) {
+			addTarget(exactMailbox.email, recipient);
+			continue;
+		}
+
+		const recipientDomain = recipient.split("@")[1];
+		if (!recipientDomain || !configuredDomains.has(recipientDomain)) {
+			console.log(`Ignoring recipient ${recipient}: domain is not configured.`);
+			continue;
+		}
+
+		const aliasMatches = mailboxes.filter((mailbox) => {
+			const mailboxEmail = normalizeEmailAddress(mailbox.email);
+			return (
+				isAliasRoutingEnabled(mailbox.settings) &&
+				(allowedAddresses.size === 0 || allowedAddresses.has(mailboxEmail)) &&
+				matchesAliasRoute(mailboxEmail, recipient)
+			);
+		});
+
+		if (aliasMatches.length === 1) {
+			addTarget(aliasMatches[0].email, recipient);
+			continue;
+		}
+
+		if (aliasMatches.length > 1) {
+			console.log(
+				`Ignoring recipient ${recipient}: multiple alias routes matched (${aliasMatches.map((m) => m.email).join(", ")}).`,
+			);
+			continue;
+		}
+
+		console.log(`Ignoring recipient ${recipient}: no mailbox route matched.`);
+	}
+
+	return Array.from(targets.values());
+}
+
+async function storeParsedAttachments(
+	bucket: R2Bucket,
+	messageId: string,
+	attachments: Awaited<ReturnType<PostalMime["parse"]>>["attachments"],
+): Promise<StoredAttachment[]> {
+	const attachmentData: StoredAttachment[] = [];
+	if (!attachments) return attachmentData;
+
+	for (const att of attachments) {
+		const attId = crypto.randomUUID();
+		const filename = (att.filename || "untitled").replace(/[\/\\:*?"<>|\x00-\x1f]/g, "_");
+		await bucket.put(`attachments/${messageId}/${attId}/${filename}`, att.content);
+		attachmentData.push({
+			id: attId,
+			email_id: messageId,
+			filename,
+			mimetype: att.mimeType,
+			size: typeof att.content === "string" ? att.content.length : att.content.byteLength,
+			content_id: att.contentId || null,
+			disposition: att.disposition || "attachment",
+		});
+	}
+
+	return attachmentData;
+}
+
 async function receiveEmail(event: { raw: ReadableStream; rawSize: number }, env: Env, _ctx: ExecutionContext) {
 	const rawEmail = await streamToArrayBuffer(event.raw, event.rawSize);
 	const parsedEmail = await new PostalMime().parse(rawEmail);
 
-	if (!parsedEmail.to?.length || !parsedEmail.to[0].address) throw new Error("received email with empty to");
-
-	const allowedAddresses = ((env.EMAIL_ADDRESSES ?? []) as string[]).map((a) => a.toLowerCase());
-	const allRecipients = parsedEmail.to.map((t) => t.address?.toLowerCase()).filter(Boolean) as string[];
+	const allRecipients = (parsedEmail.to || []).map((t) => t.address?.toLowerCase()).filter(Boolean) as string[];
 	const ccRecipients = (parsedEmail.cc || []).map((e) => e.address?.toLowerCase()).filter(Boolean) as string[];
 	const bccRecipients = (parsedEmail.bcc || []).map((e) => e.address?.toLowerCase()).filter(Boolean) as string[];
+	if (allRecipients.length + ccRecipients.length + bccRecipients.length === 0) {
+		throw new Error("received email with no valid recipient address");
+	}
+	const deliveryTargets = await resolveInboundDeliveryTargets(env, [
+		...allRecipients,
+		...ccRecipients,
+		...bccRecipients,
+	]);
 
-	let mailboxId: string | undefined;
-	if (allowedAddresses.length > 0) {
-		mailboxId = allRecipients.find((addr) => allowedAddresses.includes(addr));
-		if (!mailboxId) { console.log(`Ignoring email: no recipient matches EMAIL_ADDRESSES.`); return; }
-	} else { mailboxId = allRecipients[0]; }
-	if (!mailboxId) throw new Error("received email with no valid recipient address");
-
-	const messageId = crypto.randomUUID();
-	if (!(await env.BUCKET.head(`mailboxes/${mailboxId}.json`))) { console.log(`Ignoring email for ${mailboxId}: mailbox does not exist`); return; }
-
-	const stub = env.MAILBOX.get(env.MAILBOX.idFromName(mailboxId));
-
-	const attachmentData: StoredAttachment[] = [];
-	if (parsedEmail.attachments) {
-		for (const att of parsedEmail.attachments) {
-			const attId = crypto.randomUUID();
-			const filename = (att.filename || "untitled").replace(/[\/\\:*?"<>|\x00-\x1f]/g, "_");
-			await env.BUCKET.put(`attachments/${messageId}/${attId}/${filename}`, att.content);
-			attachmentData.push({ id: attId, email_id: messageId, filename, mimetype: att.mimeType,
-				size: typeof att.content === "string" ? att.content.length : att.content.byteLength,
-				content_id: att.contentId || null, disposition: att.disposition || "attachment" });
-		}
+	if (deliveryTargets.length === 0) {
+		console.log("Ignoring email: no recipient matches a mailbox route.");
+		return;
 	}
 
 	const extractMsgId = (s: string) => { const m = s.match(/<([^>]+)>/); return m ? m[1] : s.trim().split(/\s+/)[0]; };
 	const inReplyTo = parsedEmail.inReplyTo ? extractMsgId(parsedEmail.inReplyTo) : null;
 	const emailReferences = parsedEmail.references ? parsedEmail.references.split(/\s+/).filter(Boolean).map(extractMsgId) : [];
-	let threadId = emailReferences[0] || inReplyTo || messageId;
-
-	if (!inReplyTo && emailReferences.length === 0) {
-		const subjectThread = await (stub as any).findThreadBySubject(parsedEmail.subject || "", parsedEmail.from?.address || undefined);
-		if (subjectThread) threadId = subjectThread;
-	}
-
 	const originalMessageId = parsedEmail.messageId ? extractMsgId(parsedEmail.messageId) : null;
 
-	await stub.createEmail(Folders.INBOX, {
-		id: messageId, subject: parsedEmail.subject || "",
-		sender: (parsedEmail.from?.address || "").toLowerCase(), recipient: allRecipients.join(", "),
-		cc: ccRecipients.join(", ") || null, bcc: bccRecipients.join(", ") || null,
-		date: new Date().toISOString(), // uses receive time, not the email's Date header
-		body: parsedEmail.html || parsedEmail.text || "",
-		in_reply_to: inReplyTo, email_references: emailReferences.length > 0 ? JSON.stringify(emailReferences) : null,
-		thread_id: threadId, message_id: originalMessageId, raw_headers: JSON.stringify(parsedEmail.headers),
-	}, attachmentData);
+	for (const target of deliveryTargets) {
+		const messageId = crypto.randomUUID();
+		const stub = env.MAILBOX.get(env.MAILBOX.idFromName(target.mailboxId));
+		const attachmentData = await storeParsedAttachments(env.BUCKET, messageId, parsedEmail.attachments);
+		let threadId = emailReferences[0] || inReplyTo || messageId;
+
+		if (!inReplyTo && emailReferences.length === 0) {
+			const subjectThread = await (stub as any).findThreadBySubject(parsedEmail.subject || "", parsedEmail.from?.address || undefined);
+			if (subjectThread) threadId = subjectThread;
+		}
+
+		await stub.createEmail(Folders.INBOX, {
+			id: messageId, subject: parsedEmail.subject || "",
+			sender: (parsedEmail.from?.address || "").toLowerCase(), recipient: Array.from(target.recipients).join(", "),
+			cc: ccRecipients.join(", ") || null, bcc: bccRecipients.join(", ") || null,
+			date: new Date().toISOString(), // uses receive time, not the email's Date header
+			body: parsedEmail.html || parsedEmail.text || "",
+			in_reply_to: inReplyTo, email_references: emailReferences.length > 0 ? JSON.stringify(emailReferences) : null,
+			thread_id: threadId, message_id: originalMessageId, raw_headers: JSON.stringify(parsedEmail.headers),
+		}, attachmentData);
+	}
 }
 
 export { app, receiveEmail };
