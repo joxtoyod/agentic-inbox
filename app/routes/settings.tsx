@@ -20,12 +20,14 @@ export default function SettingsRoute() {
 
 	const [displayName, setDisplayName] = useState("");
 	const [agentPrompt, setAgentPrompt] = useState("");
+	const [aliasRoutingEnabled, setAliasRoutingEnabled] = useState(false);
 	const [isSaving, setIsSaving] = useState(false);
 
 	useEffect(() => {
 		if (mailbox) {
 			setDisplayName(mailbox.settings?.fromName || mailbox.name || "");
 			setAgentPrompt(mailbox.settings?.agentSystemPrompt || "");
+			setAliasRoutingEnabled(mailbox.settings?.aliasRouting?.enabled === true);
 		}
 	}, [mailbox]);
 
@@ -35,14 +37,16 @@ export default function SettingsRoute() {
 		const settings = {
 			...mailbox.settings,
 			fromName: displayName,
+			aliasRouting: { enabled: aliasRoutingEnabled },
 			agentSystemPrompt: agentPrompt.trim() || undefined,
 		};
 		try {
 			await updateMailboxMutation.mutateAsync({ mailboxId, settings });
 			toastManager.add({ title: "Settings saved!" });
-		} catch {
+		} catch (err: unknown) {
+			const message = (err instanceof Error ? err.message : null) || "Failed to save settings";
 			toastManager.add({
-				title: "Failed to save settings",
+				title: message,
 				variant: "error",
 			});
 		} finally {
@@ -81,6 +85,26 @@ export default function SettingsRoute() {
 							onChange={(e) => setDisplayName(e.target.value)}
 						/>
 						<Input label="Email" type="email" value={mailbox.email} disabled />
+						<label className="flex items-start gap-3 rounded-lg border border-kumo-line bg-kumo-recessed p-3">
+							<input
+								type="checkbox"
+								className="mt-0.5"
+								checked={aliasRoutingEnabled}
+								onChange={(e) => setAliasRoutingEnabled(e.target.checked)}
+							/>
+							<span>
+								<span className="block text-sm font-medium text-kumo-default">
+									Route matching aliases to this mailbox
+								</span>
+								<span className="block text-xs text-kumo-subtle mt-1">
+									Receives mail sent to {mailbox.email},{" "}
+									{mailbox.email.replace("@", "-anything@")}, and{" "}
+									{mailbox.email.replace("@", "+anything@")}. Does not match{" "}
+									{mailbox.email.replace("@", "ing@")} or{" "}
+									{mailbox.email.replace("@", "123@")}.
+								</span>
+							</span>
+						</label>
 					</div>
 				</div>
 

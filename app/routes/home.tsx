@@ -47,6 +47,7 @@ export default function HomeRoute() {
 	const [newPrefix, setNewPrefix] = useState("");
 	const [selectedDomain, setSelectedDomain] = useState("");
 	const [newName, setNewName] = useState("");
+	const [aliasRoutingEnabled, setAliasRoutingEnabled] = useState(false);
 	const [isCreating, setIsCreating] = useState(false);
 	const [createError, setCreateError] = useState<string | null>(null);
 	const [isDeleteOpen, setIsDeleteOpen] = useState(false);
@@ -98,13 +99,15 @@ export default function HomeRoute() {
 		}
 		const email = `${newPrefix}@${selectedDomain}`;
 		const name = newName || newPrefix;
+		const settings = { aliasRouting: { enabled: aliasRoutingEnabled } };
 		setIsCreating(true);
 		try {
-			await createMailbox.mutateAsync({ email, name });
+			await createMailbox.mutateAsync({ email, name, settings });
 			toastManager.add({ title: "Mailbox created successfully!" });
 			setIsCreateOpen(false);
 			setNewPrefix("");
 			setNewName("");
+			setAliasRoutingEnabled(false);
 		} catch (err: unknown) {
 			const message = (err instanceof Error ? err.message : null) || "Failed to create mailbox";
 			setCreateError(message);
@@ -134,6 +137,7 @@ export default function HomeRoute() {
 				id: addr,
 				email: addr,
 				name: addr.split("@")[0] || addr,
+				settings: mailboxes.find((m) => m.email.toLowerCase() === addr.toLowerCase())?.settings,
 			}))
 		: mailboxes;
 
@@ -186,6 +190,11 @@ export default function HomeRoute() {
 									<div className="text-sm text-kumo-subtle">
 										{account.email}
 									</div>
+									{account.settings?.aliasRouting?.enabled && (
+										<div className="text-xs text-kumo-subtle mt-0.5">
+											Alias routing
+										</div>
+									)}
 								</div>
 								{!isConfigured && (
 									<Button
@@ -298,6 +307,27 @@ export default function HomeRoute() {
 							value={newName}
 							onChange={(e) => setNewName(e.target.value)}
 						/>
+						<label className="flex items-start gap-3 rounded-lg border border-kumo-line bg-kumo-recessed p-3">
+							<input
+								type="checkbox"
+								className="mt-0.5"
+								checked={aliasRoutingEnabled}
+								onChange={(e) => setAliasRoutingEnabled(e.target.checked)}
+							/>
+							<span>
+								<span className="block text-sm font-medium text-kumo-default">
+									Route matching aliases to this mailbox
+								</span>
+								<span className="block text-xs text-kumo-subtle mt-1">
+									Receives mail sent to {newPrefix || "test"}@
+									{selectedDomain || "domain"}, {newPrefix || "test"}-anything@
+									{selectedDomain || "domain"}, and {newPrefix || "test"}+anything@
+									{selectedDomain || "domain"}. Does not match {(newPrefix || "test")}ing@
+									{selectedDomain || "domain"} or {newPrefix || "test"}123@
+									{selectedDomain || "domain"}.
+								</span>
+							</span>
+						</label>
 						<div className="flex justify-end gap-2 pt-2">
 							<Dialog.Close
 								render={(props) => (

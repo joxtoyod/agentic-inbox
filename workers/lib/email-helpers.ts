@@ -13,6 +13,12 @@ import type { EmailFull } from "./schemas";
 import { Folders } from "../../shared/folders";
 import type { Env } from "../types";
 import { formatQuotedDate } from "../../shared/dates";
+import {
+	isAliasRoutingEnabled,
+	matchesAliasRoute,
+	normalizeEmailAddress,
+	type MailboxAliasSettings,
+} from "../../shared/alias-routing";
 
 // ── DO Stub ────────────────────────────────────────────────────────
 
@@ -44,6 +50,21 @@ export async function listMailboxes(
 	});
 }
 
+export async function listMailboxesWithSettings(
+	bucket: R2Bucket,
+): Promise<{ id: string; email: string; settings: MailboxAliasSettings }[]> {
+	const mailboxes = await listMailboxes(bucket);
+	return Promise.all(
+		mailboxes.map(async (mailbox) => {
+			const obj = await bucket.get(`mailboxes/${mailbox.id}.json`);
+			const settings = obj
+				? ((await obj.json().catch(() => ({}))) as MailboxAliasSettings)
+				: {};
+			return { ...mailbox, settings };
+		}),
+	);
+}
+
 // ── Sender Validation ──────────────────────────────────────────────
 
 /**
@@ -54,11 +75,20 @@ export function validateSender(
 	to: string | string[],
 	from: string | { email: string; name: string },
 	mailboxId: string,
+	settings?: MailboxAliasSettings,
+	allowAliasSender = false,
 ): { toStr: string; fromEmail: string; fromDomain: string } {
 	const toStr = (Array.isArray(to) ? to.join(", ") : to).toLowerCase();
 	const fromEmail = (typeof from === "string" ? from : from.email).toLowerCase();
 
-	if (fromEmail !== mailboxId.toLowerCase()) {
+	const normalizedMailboxId = normalizeEmailAddress(mailboxId);
+	const isCanonicalSender = fromEmail === normalizedMailboxId;
+	const isAllowedAliasSender =
+		allowAliasSender &&
+		isAliasRoutingEnabled(settings) &&
+		matchesAliasRoute(normalizedMailboxId, fromEmail);
+
+	if (!isCanonicalSender && !isAllowedAliasSender) {
 		throw new SenderValidationError("From address must match the mailbox email address");
 	}
 

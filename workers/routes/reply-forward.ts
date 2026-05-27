@@ -17,9 +17,25 @@ import {
 import { SendEmailRequestSchema } from "../lib/schemas";
 import { Folders } from "../../shared/folders";
 import type { MailboxContext } from "../lib/mailbox";
+import { normalizeEmailAddress } from "../../shared/alias-routing";
 
 type AppContext = Context<MailboxContext>;
 type RateLimitStub = { checkSendRateLimit: () => Promise<string | null> };
+
+async function getMailboxSettings(
+	c: AppContext,
+	mailboxId: string,
+): Promise<Record<string, unknown>> {
+	const obj = await c.env.BUCKET.get(`mailboxes/${mailboxId}.json`);
+	return obj ? ((await obj.json().catch(() => ({}))) as Record<string, unknown>) : {};
+}
+
+function splitStoredAddresses(value?: string | null): string[] {
+	return (value || "")
+		.split(",")
+		.map((address) => normalizeEmailAddress(address))
+		.filter(Boolean);
+}
 
 export async function handleReplyEmail(c: AppContext) {
 	const mailboxId = c.req.param("mailboxId") ?? "";
@@ -39,7 +55,14 @@ export async function handleReplyEmail(c: AppContext) {
 
 	let toStr: string, fromEmail: string, fromDomain: string;
 	try {
-		({ toStr, fromEmail, fromDomain } = validateSender(to, from, mailboxId));
+		const settings = await getMailboxSettings(c, mailboxId);
+		({ toStr, fromEmail, fromDomain } = validateSender(to, from, mailboxId, settings, true));
+		if (
+			fromEmail !== normalizeEmailAddress(mailboxId) &&
+			!splitStoredAddresses(originalEmail.recipient).includes(fromEmail)
+		) {
+			return c.json({ error: "Alias sender must match the original recipient address" }, 400);
+		}
 	} catch (e) {
 		if (e instanceof SenderValidationError) return c.json({ error: e.message }, 400);
 		throw e;
@@ -129,7 +152,8 @@ export async function handleForwardEmail(c: AppContext) {
 
 	let toStr: string, fromEmail: string, fromDomain: string;
 	try {
-		({ toStr, fromEmail, fromDomain } = validateSender(to, from, mailboxId));
+		const settings = await getMailboxSettings(c, mailboxId);
+		({ toStr, fromEmail, fromDomain } = validateSender(to, from, mailboxId, settings));
 	} catch (e) {
 		if (e instanceof SenderValidationError) return c.json({ error: e.message }, 400);
 		throw e;

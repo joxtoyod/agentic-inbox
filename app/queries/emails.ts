@@ -243,6 +243,7 @@ export function useSaveDraft() {
 				bcc?: string;
 				subject?: string;
 				body: string;
+				from?: string;
 				in_reply_to?: string;
 				thread_id?: string;
 				draft_id?: string;
